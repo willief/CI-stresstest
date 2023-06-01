@@ -1,0 +1,427 @@
+name: Nightly. Full Network Tests
+
+on:
+  schedule:
+    - cron:  '0 0 * * *'
+
+env:
+  CARGO_INCREMENTAL: 0 # bookkeeping for incremental builds has overhead, not useful in CI.
+  WORKFLOW_URL: https://github.com/maidsafe/stableset_net/actions/runs
+
+jobs:
+  e2e:
+    name: E2E tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins
+        timeout-minutes: 30
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet -- --interval 2000 --node-path ./target/release/safenode
+        id: section-startup
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: Set contact env var node.
+        shell: bash
+        # get all nodes listen ports
+        run: echo "SAFE_PEERS=$(rg "listening on \".+\"" ~/.safe -u | rg '/ip4.*$' -m1 -o | rg '"' -r '')" >> "$GITHUB_ENV"
+
+      - name: Check contact peer
+        shell: bash
+        run: echo "Peer is $SAFE_PEERS"
+    
+      
+      - name: Start a client to carry out chunk actions
+        run: cargo run --bin safe --release -- files upload -- "./resources"
+        id: client-chunk-actions
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to create a register
+        run: cargo run --bin safe --release -- register create baobao
+        id: client-register-create
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to get a register
+        run: cargo run --bin safe --release -- register get baobao
+        id: client-register-get
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to edit a register
+        run: cargo run --bin safe --release -- register edit baobao wood
+        id: client-register-edit
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a faucet client to claim genesis
+        run: cargo run --bin faucet --release -- claim-genesis
+        id: faucet-claim-genesis
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Kill all nodes on Windows
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os == 'windows-latest'
+        continue-on-error: true
+        run: |
+          taskkill /IM safenode.exe
+          echo "$(tasklist | rg "safenode" | wc -l) nodes still running"
+
+      - name: Kill all nodes on non-Windows OS
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os != 'windows-latest'
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: sn_node_logs_nightly_e2e_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
+
+      - name: post notification to slack on failure
+        if: ${{ failure() }}
+        uses: bryannice/gitactions-slack-notification@2.0.0
+        env:
+          SLACK_INCOMING_WEBHOOK: ${{ secrets.SLACK_GH_ACTIONS_WEBHOOK_URL }}
+          SLACK_MESSAGE: "Please check the logs for the run at ${{ env.WORKFLOW_URL }}/${{ github.run_id }}"
+          SLACK_TITLE: "Nightly E2E Test Run Failed"
+
+
+  full_unit:
+    name: Full Unit Tests (including proptests)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      - name: Build tests before running
+        run: cargo test --no-run --release
+        timeout-minutes: 30
+
+      - name: Run network tests
+        # Only run on PRs w/ ubuntu
+        timeout-minutes: 25
+        run: cargo test --release -p sn_networking
+
+      - name: Run protocol tests
+        timeout-minutes: 25
+        run: cargo test --release -p sn_protocol
+
+      - name: Run storage tests
+        shell: bash
+        timeout-minutes: 25
+        env:
+          PROPTEST_CASES: 512
+        run: cargo test --release -p sn_record_store
+
+      - name: Run register tests
+        shell: bash
+        timeout-minutes: 25
+        env:
+          PROPTEST_CASES: 512
+        run: cargo test --release -p sn_registers
+
+      - name: post notification to slack on failure
+        if: ${{ failure() }}
+        uses: bryannice/gitactions-slack-notification@2.0.0
+        env:
+          SLACK_INCOMING_WEBHOOK: ${{ secrets.SLACK_GH_ACTIONS_WEBHOOK_URL }}
+          SLACK_MESSAGE: "Please check the logs for the run at ${{ env.WORKFLOW_URL }}/${{ github.run_id }}"
+          SLACK_TITLE: "Nightly Unit Test Run Failed"
+
+  spend_test:
+    name: dbc spend tests against network
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins --features local-discovery
+        timeout-minutes: 30
+
+      - name: Build testing executable
+        run: cargo test --release multiple_sequential_transfers_succeed --no-run
+        timeout-minutes: 30
+        env:
+          CARGO_TARGET_DIR: "./transfer-target"
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet --features verify-nodes -- --interval 2000 --node-path ./target/release/safenode
+        id: section-startup
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: execute the dbc spend test
+        run: cargo test --release --features="local-discovery" multiple_sequential_transfers_succeed  -- --nocapture
+        id: client-spend-dbc
+        env:
+          CARGO_TARGET_DIR: "./transfer-target"
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: Kill all nodes on Windows
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os == 'windows-latest'
+        continue-on-error: true
+        run: |
+          taskkill /IM safenode.exe
+          echo "$(tasklist | rg "safenode" | wc -l) nodes still running"
+
+      - name: Kill all nodes on non-Windows OS
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os != 'windows-latest'
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: sn_node_logs_dbc_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
+
+
+      - name: post notification to slack on failure
+        if: ${{ failure() }}
+        uses: bryannice/gitactions-slack-notification@2.0.0
+        env:
+          SLACK_INCOMING_WEBHOOK: ${{ secrets.SLACK_GH_ACTIONS_WEBHOOK_URL }}
+          SLACK_MESSAGE: "Please check the logs for the run at ${{ env.WORKFLOW_URL }}/${{ github.run_id }}"
+          SLACK_TITLE: "Nightly Spend Test Run Failed"
+
+  churn:
+    name: Network churning tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins --features local-discovery
+        timeout-minutes: 30
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet --features verify-nodes -- --interval 2000 --node-path ./target/release/safenode
+        id: section-startup
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+
+      - name: Build churn tests 
+        run: cargo test --release -p sn_node --features="local-discovery" --no-run
+        timeout-minutes: 30
+        # new output folder to avoid linker issues w/ windows
+        env:
+          CARGO_TARGET_DIR: "./churn-target"
+
+      - name: Chunks data integrity during nodes churn (during 10min) (in theory)
+        run: cargo test --release -p sn_node --features="local-discovery" --test data_with_churn -- --nocapture
+        id: data_availability_during_churn
+        env:
+          # new output folder to avoid linker issues w/ windows
+          CARGO_TARGET_DIR: "./churn-target"
+          CHUNKS_ONLY: true
+          TEST_DURATION_MINS: 60
+          TEST_CHURN_CYCLES: 6
+          SN_LOG: "all"
+        timeout-minutes: 70
+      
+      - name: Verify restart of nodes using rg
+        shell: bash
+        timeout-minutes: 1
+        # get the counts, then the specific line, and then the digit count only
+        # then check we have an expected level of restarts
+        # TODO: make this use an env var, or relate to testnet size
+        run : |
+          restart_count=$(rg "Node is restarting in" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Restart $restart_count nodes"
+          detected_dead_peer=$(rg "Detected dead peer" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Detected dead peer $detected_dead_peer times"
+          if [ $detected_dead_peer -lt $restart_count ]; then
+            echo "Detected dead peer times of: $detected_dead_peer is less than the restart count of: $restart_count"
+            exit 1
+          fi
+          node_count=$(ls $log_dir | wc -l)
+          if [ $restart_count -lt $node_count ]; then
+            echo "Restart count of: $restart_count is less than the node count of: $node_count"
+            exit 1
+          fi
+
+      - name: Verify data replication using rg
+        shell: bash
+        timeout-minutes: 1
+        # get the counts, then the specific line, and then the digit count only
+        # then check we have an expected level of replication
+        # TODO: make this use an env var, or relate to testnet size
+        run : |
+          replication_count=$(rg "That's a replicate chunk in for" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Replicated $replication_count copies"
+          node_count=$(ls $log_dir | wc -l)
+          if [ $replication_count -lt $node_count ]; then
+            echo "Replication count of: $replication_count is less than the node count of: $node_count"
+            exit 1
+          fi
+
+      - name: Kill all nodes on Windows
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os == 'windows-latest'
+        continue-on-error: true
+        run: |
+          taskkill /IM safenode.exe
+          echo "$(tasklist | rg "safenode" | wc -l) nodes still running"
+
+      - name: Kill all nodes on non-Windows OS
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os != 'windows-latest'
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: sn_node_logs_churn_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
+      
+      - name: post notification to slack on failure
+        if: ${{ failure() }}
+        uses: bryannice/gitactions-slack-notification@2.0.0
+        env:
+          SLACK_INCOMING_WEBHOOK: ${{ secrets.SLACK_GH_ACTIONS_WEBHOOK_URL }}
+          SLACK_MESSAGE: "Please check the logs for the run at ${{ env.WORKFLOW_URL }}/${{ github.run_id }}"
+          SLACK_TITLE: "Nightly Churn Test Run Failed"

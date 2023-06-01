@@ -1,0 +1,434 @@
+name: Check before merge
+
+on:
+  # tests must run for a PR to be valid and pass merge queue muster
+  # on main, we want to know that all commits are passing at a glance, any deviation should help bisecting errors
+  # the merge run checks should show on master and enable this clear test/passing history
+  merge_group:
+    branches: [main]
+  pull_request:
+    branches: ["*"]
+
+env:
+  CARGO_INCREMENTAL: 0 # bookkeeping for incremental builds has overhead, not useful in CI.
+
+jobs:
+  cargo-udeps:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    name: Unused dependency check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          #Needs nightly to distinguish between deps of different versions
+          toolchain: nightly
+          # we need rustfmt here while we have a build step
+          components: rustfmt
+
+      - name: Install cargo-udeps
+        run: cargo install cargo-udeps --locked
+      - name: Run cargo-udeps
+        run: cargo +nightly udeps --all-targets
+
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@f114310111fdbd07e99f47f9ca13d62b3ec98372
+
+  checks:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    name: Run rustfmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - shell: bash
+        run: cargo clippy --all-targets --all-features -- -Dwarnings
+
+      - name: Check documentation
+        # Deny certain `rustdoc` lints that are unwanted.
+        # See https://doc.rust-lang.org/rustdoc/lints.html for lints that are 'warning' by default.
+        run: RUSTDOCFLAGS="--deny=warnings" cargo doc --no-deps
+
+  unit:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')" 
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tests before running
+        run: cargo test --no-run --release
+        timeout-minutes: 30
+
+      - name: Run network tests
+        timeout-minutes: 25
+        run: cargo test --release --package sn_networking
+
+      - name: Run protocol tests
+        timeout-minutes: 25
+        run: cargo test --release --package sn_protocol
+
+      - name: Run register tests
+        timeout-minutes: 25
+        run: cargo test --release --package sn_registers
+        env:
+          # this will speed up PR merge flows, while giving us a modicum
+          # of proptesting
+          # we do many more runs on the nightly run
+          PROPTEST_CASES: 50 
+
+      - name: Run storage tests
+        timeout-minutes: 25
+        run: cargo test --release --package sn_record_store
+        env:
+          # this will speed up PR merge flows, while giving us a modicum
+          # of proptesting
+          # we do many more runs on the nightly run
+          PROPTEST_CASES: 50 
+
+  e2e:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')" 
+    name: E2E tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins
+        timeout-minutes: 30
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet --features verify-nodes -- --interval 2000 --node-path ./target/release/safenode
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: Set contact env var node.
+        shell: bash
+        # get all nodes listen ports
+        run: echo "SAFE_PEERS=$(rg "listening on \".+\"" ~/.safe -u | rg '/ip4.*$' -m1 -o | rg '"' -r '')" >> "$GITHUB_ENV"
+
+      - name: Check contact peer
+        shell: bash
+        run: echo "Peer is $SAFE_PEERS"
+
+      - name: Start a client to upload files
+        run: cargo run --bin safe --release -- files upload -- "./resources"
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to download files
+        run: cargo run --bin safe --release -- files download
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to create a register
+        run: cargo run --bin safe --release -- register create baobao
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to get a register
+        run: cargo run --bin safe --release -- register get baobao
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a client to edit a register
+        run: cargo run --bin safe --release -- register edit baobao wood
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Start a faucet client to claim genesis
+        run: cargo run --bin faucet --release -- claim-genesis
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 2
+
+      - name: Kill all nodes
+        shell: bash
+        timeout-minutes: 1
+        if: failure()
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: safe_test_logs_e2e_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
+
+  spend_test:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')" 
+    name: dbc spend tests against network
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins --features local-discovery
+        timeout-minutes: 30
+
+      - name: Build testing executable
+        run: cargo test --release --features local-discovery multiple_sequential_transfers_succeed --no-run
+        timeout-minutes: 30
+        env:
+          CARGO_TARGET_DIR: "./transfer-target"
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet --features verify-nodes -- --interval 2000 --node-path ./target/release/safenode
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: execute the dbc spend test
+        run: cargo test --release --features="local-discovery" multiple_sequential_transfers_succeed  -- --nocapture
+        env:
+          SN_LOG: "all"
+          CARGO_TARGET_DIR: "./transfer-target"
+        timeout-minutes: 10
+
+      - name: Kill all nodes
+        shell: bash
+        timeout-minutes: 1
+        if: failure()
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: safe_test_logs_dbc_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
+
+  churn:
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    name: Network churning tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install ripgrep ubuntu
+        run: sudo apt-get install ripgrep
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: install ripgrep mac
+        run: brew install ripgrep
+        if: matrix.os == 'macos-latest'
+
+      - name: install ripgrep windows
+        run: choco install ripgrep
+        if: matrix.os == 'windows-latest'
+
+      - name: Build sn bins
+        run: cargo build --release --bins --features local-discovery
+        timeout-minutes: 30
+
+      - name: Start a local network
+        run: cargo run --release --bin testnet --features verify-nodes -- --interval 2000 --node-path ./target/release/safenode
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      - name: Build churn tests 
+        run: cargo test --release -p sn_node --features="local-discovery" --no-run
+        timeout-minutes: 30
+        # new output folder to avoid linker issues w/ windows
+        env:
+          CARGO_TARGET_DIR: "./churn-target"
+
+      - name: Chunks data integrity during nodes churn (during 10min)
+        run: cargo test --release -p sn_node --features="local-discovery" --test data_with_churn -- --nocapture 
+        env:
+          # new output folder to avoid linker issues w/ windows
+          CARGO_TARGET_DIR: "./churn-target"
+          CHUNKS_ONLY: true
+          TEST_DURATION_MINS: 10
+          SN_LOG: "all"
+        timeout-minutes: 30
+
+      - name: Verify restart of nodes using rg
+        shell: bash
+        timeout-minutes: 1
+        # get the counts, then the specific line, and then the digit count only
+        # then check we have an expected level of restarts
+        # TODO: make this use an env var, or relate to testnet size
+        run : |
+          restart_count=$(rg "Node is restarting in" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Restart $restart_count nodes"
+          detected_dead_peer=$(rg "Detected dead peer" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Detected dead peer $detected_dead_peer times"
+          if [ $detected_dead_peer -lt $restart_count ]; then
+            echo "Detected dead peer times of: $detected_dead_peer is less than the restart count of: $restart_count"
+            exit 1
+          fi
+          node_count=$(ls $log_dir | wc -l)
+          if [ $restart_count -lt $node_count ]; then
+            echo "Restart count of: $restart_count is less than the node count of: $node_count"
+            exit 1
+          fi
+
+      - name: Verify data replication using rg
+        shell: bash
+        timeout-minutes: 1
+        # get the counts, then the specific line, and then the digit count only
+        # then check we have an expected level of replication
+        # TODO: make this use an env var, or relate to testnet size
+        run : |
+          replication_count=$(rg "That's a replicate chunk in for" ~/.safe/node/local-test-network -c --stats | rg "(\d+) matches" | rg "\d+" -o)
+          echo "Replicated $replication_count copies"
+          node_count=$(ls $log_dir | wc -l)
+          if [ $replication_count -lt $node_count ]; then
+            echo "Replication count of: $replication_count is less than the node count of: $node_count"
+            exit 1
+          fi
+
+      - name: Kill all nodes on Windows
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os == 'windows-latest'
+        continue-on-error: true
+        run: |
+          taskkill /?
+          taskkill /IM safenode.exe /T
+          echo "$(tasklist | rg "safenode" | wc -l) nodes still running"
+
+      - name: Kill all nodes on non-Windows OS
+        shell: bash
+        timeout-minutes: 1
+        if: always() && matrix.os != 'windows-latest'
+        continue-on-error: true
+        run: |
+          pkill safenode
+          echo "$(pgrep safenode | wc -l) nodes still running"
+
+      - name: Tar log files
+        shell: bash
+        continue-on-error: true
+        run: |
+          find ~/.safe/node/local-test-network -iname '*.log*' | tar -zcvf log_files.tar.gz --files-from -
+        if: failure()
+
+      - name: Upload Node Logs
+        uses: actions/upload-artifact@main
+        with:
+          name: safe_test_logs_churn_${{matrix.os}}
+          path: log_files.tar.gz
+        if: failure()
+        continue-on-error: true
