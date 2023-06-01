@@ -15,8 +15,8 @@ jobs:
       - name: List files in the repository
         run: |
           ls -al ${{ github.workspace }}
-          cd ~/projects/maidsafe/safe_network
-          cargo run --release --bin testnet -- --interval 2000 --node-path ./target/release/safenode
+          # cd ~/projects/maidsafe/safe_network
+          # cargo run --release --bin testnet -- --interval 2000 --node-path ./target/release/safenode
 
       - run: echo "🍏 This job's status is ${{ job.status }}."
 #  name: Start a local network

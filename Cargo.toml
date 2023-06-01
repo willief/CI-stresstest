@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "sn_build_info",
+    "sn_cli",
+    "sn_client",
+    "sn_logging",
+    "sn_networking",
+    "sn_node",
+    "sn_peers_acquisition",
+    "sn_protocol",
+    "sn_record_store",
+    "sn_registers",
+    "sn_testnet",
+    "sn_transfers",
+]
